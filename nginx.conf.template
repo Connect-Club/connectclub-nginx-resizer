@@ -1,0 +1,199 @@
+user www-data;
+worker_processes 4;
+pid /run/nginx.pid;
+load_module /usr/local/nginx/modules/ngx_http_small_light_module.so;
+error_log /dev/stderr;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    # # http headers
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+    # caches
+    proxy_cache_path /tmp/nginx_cache_resized levels=1:2 keys_zone=nginx_cache_resized:100M max_size=30G inactive=40d;
+    proxy_cache_path /tmp/nginx_cache_original levels=1:2 keys_zone=nginx_cache_original:100M max_size=30G inactive=40d;
+    # real_ip
+    set_real_ip_from  127.0.0.0/23;
+    set_real_ip_from  ${SET_REAL_IP_FROM};
+    real_ip_header    X-Real-IP;
+    real_ip_recursive on;
+    # limits
+    # limit_conn_zone $binary_remote_addr zone=addr:10m;
+    # limit_req_zone $binary_remote_addr zone=one:10m rate=2r/s;
+
+    lua_shared_dict bigfiles 10m;
+
+    log_format upstream_time '$remote_addr - $remote_user [$time_local] '
+                        '"$request" $status $body_bytes_sent '
+                        '"$http_referer" "$http_user_agent" '
+                        'urt="$upstream_response_time" '
+                        'warmer="$warmer"';
+
+    access_log /dev/stdout upstream_time;
+
+    log_subrequest on;
+    include       mime.types;
+    default_type  application/octet-stream;
+    resolver 8.8.8.8 1.1.1.1 valid=600s ipv6=off;
+    resolver_timeout 10s;
+    client_max_body_size 100M;
+    proxy_connect_timeout   60;
+    proxy_send_timeout      60;
+    proxy_read_timeout      60;
+
+    server {
+        listen 3000;
+        add_header Access-Control-Allow-Origin "*";
+        location ~ ^/([0-9]+)x([0-9]+)/(.+) {
+            set $filename $3;
+            set $warmer "no";
+            set_by_lua_block $isbig {
+                local bigfiles = ngx.shared.bigfiles
+                local isbig = bigfiles:get(ngx.var.filename)
+                -- check cache-warmer header
+                local h = ngx.req.get_headers()
+                if h["Magic-Header"] == "warmerabcd" then
+                    isbig = "SMALL"
+                    ngx.var.warmer = "true"
+                end
+
+                if not isbig then
+                    isbig = "SMALL"
+                end
+                return isbig
+            }
+            if ($isbig = BIG) {
+                proxy_pass http://127.0.0.1:10177/limited/small_light(dw=$1,dh=$2,e=imlib2,q=95,da=l,ds=s,jpeghint=y)/$3;
+                break;
+            }
+            proxy_pass http://127.0.0.1:10177/small_light(dw=$1,dh=$2,e=imlib2,q=95,da=l,ds=s,jpeghint=y)/$3;
+            proxy_cache nginx_cache_resized;
+            proxy_cache_valid 30d;
+            proxy_buffering on;
+            proxy_ignore_headers "Cache-Control" "Expires";
+            proxy_intercept_errors on;
+            error_page 415 = @error;
+        }
+        location ~ ^/crop/([0-9]+)x([0-9]+)/(.+) {
+            set $filename $3;
+            set $warmer "no";
+            set_by_lua_block $isbig {
+                local bigfiles = ngx.shared.bigfiles
+                local isbig = bigfiles:get(ngx.var.filename)
+                -- check cache-warmer header
+                local h = ngx.req.get_headers()
+                if h["Magic-Header"] == "warmerabcd" then
+                    isbig = "SMALL"
+                    ngx.var.warmer = "true"
+                end
+
+                if not isbig then
+                    isbig = "SMALL"
+                end
+                return isbig
+            }
+            if ($isbig = BIG) {
+                proxy_pass http://127.0.0.1:10177/limited/small_light(dw=$1,dh=$2,cw=$1,ch=$2,dx=0,dy=0,e=imlib2,q=95,da=s,ds=n,jpeghint=y)/$3;
+                break;
+            }
+            proxy_pass http://127.0.0.1:10177/small_light(dw=$1,dh=$2,cw=$1,ch=$2,dx=0,dy=0,e=imlib2,q=95,da=s,ds=n,jpeghint=y)/$3;
+            proxy_cache nginx_cache_resized;
+            proxy_cache_valid 30d;
+            proxy_buffering on;
+            proxy_ignore_headers "Cache-Control" "Expires";
+            proxy_intercept_errors on;
+            error_page 415 = @error;
+        }
+        location @error {
+            return 429 "Try again later";
+        }
+    }
+
+    server {
+        listen 10177;
+        # allow 127.0.0.1; # we use real_ip_module
+        # deny all;
+        small_light on;
+        small_light_buffer 200m;
+
+        location ~ ^/small_light[^/]*/(.+)$ {
+            set $file $1;
+            proxy_pass http://127.0.0.1:10178/withlru/$file;
+            proxy_cache_key "$file";
+            proxy_cache nginx_cache_original;
+            proxy_cache_valid 30d;
+            proxy_buffering on;
+        }
+        location ~ ^/limited/small_light[^/]*/(.+)$ {
+            set $file $1;
+            # limit_conn addr 12;
+            # limit_req zone=one;
+            proxy_pass http://127.0.0.1:10178/withlru/$file;
+            proxy_cache_key "$file";
+            proxy_cache nginx_cache_original;
+            proxy_cache_valid 30d;
+            proxy_buffering on;
+        }
+    }
+
+    upstream storage_upstream {
+        server ${STORAGE_SERVER}:${STORAGE_PORT};
+    }
+
+    server {
+        listen 10178;
+        ## not work with realip module
+        # allow 127.0.0.1;
+        # deny all;
+        ##
+
+        proxy_http_version 1.1;
+        proxy_pass_request_body off;
+        proxy_pass_request_headers off;
+        proxy_max_temp_file_size 0;
+        proxy_buffering off;
+
+        proxy_hide_header "x-guploader-uploadid";
+        proxy_hide_header "x-goog-generation";
+        proxy_hide_header "x-goog-metageneration";
+        proxy_hide_header "x-goog-stored-content-encoding";
+        proxy_hide_header "x-goog-stored-content-length";
+        proxy_hide_header "x-goog-hash";
+        proxy_hide_header "x-goog-storage-class";
+        proxy_hide_header "Set-Cookie";
+        proxy_ignore_headers "Set-Cookie";
+
+        # test if file in cache
+        location ~ ^/testlru/(.+) {
+            set $filename $1;
+            content_by_lua_block {
+                local bigfiles = ngx.shared.bigfiles
+                local size = bigfiles:get(ngx.var.filename)
+                if not size then
+                    size = "SMALL"
+                end
+                ngx.say(ngx.var.filename .. size)
+            }
+        }
+
+        # save filename to cache if it big
+        location ~ ^/withlru/(.+) {
+            set $filename $1;
+            log_by_lua_block {
+                local bigfiles = ngx.shared.bigfiles
+                local size = tonumber(ngx.var.upstream_response_length)
+                if size > 1048576 then -- 1048576 == 1 Mb
+                    bigfiles:safe_set(ngx.var.filename, "BIG")
+                end
+            }
+            proxy_pass ${STORAGE_SCHEME}://storage_upstream/${STORAGE_BUCKET}/$filename;
+            proxy_set_header Host ${STORAGE_SERVER};
+        }
+    }
+}
